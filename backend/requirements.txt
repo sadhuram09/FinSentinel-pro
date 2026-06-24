@@ -1,0 +1,13 @@
+fastapi>=0.110,<1.0
+uvicorn[standard]>=0.29,<1.0
+pydantic>=2.6,<3.0
+yfinance>=0.2.40
+xgboost>=2.0
+lightgbm>=4.3
+shap>=0.45
+scikit-learn>=1.4
+pandas>=2.2
+pandas-ta>=0.3.14b0
+python-dotenv>=1.0
+langgraph>=0.2,<1.0
+groq>=0.11
