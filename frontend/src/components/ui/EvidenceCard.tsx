@@ -24,6 +24,8 @@ interface EvidenceCardProps {
   children: ReactNode;
   className?: string;
   style?: CSSProperties;
+  /** Smaller padding/type and no auto micro-label — for dense rows of cards. */
+  compact?: boolean;
 }
 
 const OPACITY: Record<ConfidenceLevel, number> = {
@@ -49,6 +51,7 @@ export default function EvidenceCard({
   children,
   className = "",
   style,
+  compact = false,
 }: EvidenceCardProps) {
   const rotation = seededRotation(id);
   const isLow = confidenceLevel === "low";
@@ -74,12 +77,20 @@ export default function EvidenceCard({
   return (
     <div
       style={cardStyle}
-      className={`dog-ear shadow-card relative rounded-[3px] border border-black/15 bg-paper px-5 py-4 text-ink ${className}`}
+      className={`dog-ear shadow-card relative rounded-[3px] border border-black/15 bg-paper text-ink ${
+        compact ? "px-4 py-3" : "px-5 py-4"
+      } ${className}`}
     >
-      <div className="font-sans text-[15px] leading-relaxed text-ink/90">{children}</div>
-      <div className="mt-3 font-mono text-[10px] uppercase tracking-[0.16em] text-ink/45">
-        evidence · {confidenceLevel}
+      <div
+        className={`font-sans leading-relaxed text-ink/90 ${compact ? "text-[13px]" : "text-[15px]"}`}
+      >
+        {children}
       </div>
+      {!compact && (
+        <div className="mt-3 font-mono text-[10px] uppercase tracking-[0.16em] text-ink/45">
+          evidence · {confidenceLevel}
+        </div>
+      )}
     </div>
   );
 }
