@@ -17,6 +17,7 @@ import { ChevronDown } from "lucide-react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 
 import AnalysisScrollReveal from "../components/ui/AnalysisScrollReveal";
+import AppHeader, { type AppUser } from "../components/ui/AppHeader";
 import EvidenceCard, { type ConfidenceLevel } from "../components/ui/EvidenceCard";
 import VerdictStamp, { type Verdict } from "../components/ui/VerdictStamp";
 
@@ -133,6 +134,7 @@ export default function Analysis() {
   const { id } = useParams();
   const navigate = useNavigate();
   const [data, setData] = useState<HistoryDetail | null>(null);
+  const [user, setUser] = useState<AppUser | null>(null);
   const [status, setStatus] = useState<"loading" | "ready" | "notfound">("loading");
   const [open, setOpen] = useState<Record<string, boolean>>({});
 
@@ -142,6 +144,12 @@ export default function Analysis() {
     let active = true;
     (async () => {
       try {
+        // User for the shared header (also doubles as the auth guard).
+        const me = await fetch(`${API_BASE}/auth/me`, { credentials: "include" });
+        if (!active) return;
+        if (me.status === 401) return navigate("/login");
+        if (me.ok) setUser((await me.json()) as AppUser);
+
         const res = await fetch(`${API_BASE}/history/${id}`, { credentials: "include" });
         if (!active) return;
         if (res.status === 401) return navigate("/login");
@@ -184,20 +192,17 @@ export default function Analysis() {
 
   return (
     <div className="min-h-screen">
-      {/* Header */}
-      <header className="border-b border-ink px-6 py-5 sm:px-10">
-        <Link to="/dashboard" className="font-mono text-xs text-paper-muted hover:text-paper">
-          ← back to dashboard
-        </Link>
-        <div className="mt-3 flex flex-wrap items-baseline gap-x-5 gap-y-1">
+      <AppHeader user={user} showBack />
+
+      <main className="mx-auto max-w-3xl px-6 pb-24 sm:px-10">
+        {/* Ticker + run date */}
+        <div className="flex flex-wrap items-baseline gap-x-5 gap-y-1 pt-12">
           <h1 className="font-mono text-4xl font-bold tracking-tight text-paper">{data.ticker}</h1>
           <span className="font-mono text-sm text-paper-muted">{fmtDate(data.created_at)}</span>
         </div>
-      </header>
 
-      <main className="mx-auto max-w-3xl px-6 pb-24 sm:px-10">
         {/* THE VERDICT */}
-        <section className="pt-16">
+        <section className="pt-12">
           <div className="flex flex-wrap items-center gap-5">
             <VerdictStamp verdict={a.judge_verdict.verdict} />
             <span className="font-mono text-sm text-paper-muted">

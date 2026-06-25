@@ -9,7 +9,9 @@ import DocumentTexture from "./components/ui/DocumentTexture";
 import Analysis from "./pages/Analysis";
 import Auth from "./pages/Auth";
 import Dashboard from "./pages/Dashboard";
+import History from "./pages/History";
 import Landing from "./pages/Landing";
+import Settings from "./pages/Settings";
 
 function App() {
   return (
@@ -21,7 +23,9 @@ function App() {
         <Route path="/login" element={<Auth />} />
         <Route path="/signup" element={<Auth />} />
         <Route path="/dashboard" element={<Dashboard />} />
+        <Route path="/history" element={<History />} />
         <Route path="/analysis/:id" element={<Analysis />} />
+        <Route path="/settings" element={<Settings />} />
       </Routes>
     </BrowserRouter>
   );
