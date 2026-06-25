@@ -127,6 +127,17 @@ def _direction_from_prob(prob_up: float) -> Direction:
     return Direction.FLAT
 
 
+def _confidence_interval(p_a: float, p_b: float) -> tuple[float, float]:
+    """Probability interval from the two boosters' disagreement, clamped to [0, 1].
+
+    The spread between the XGBoost and LightGBM probabilities is the forecast's
+    uncertainty band: wider = less agreement. Returned as (lower, upper).
+    """
+    lower = max(0.0, min(p_a, p_b))
+    upper = min(1.0, max(p_a, p_b))
+    return (lower, upper)
+
+
 class StackedForecaster:
     """Weighted-average ensemble of XGBoost and LightGBM classifiers.
 
@@ -245,8 +256,7 @@ class StackedForecaster:
         xgb, lgbm = self._models[5]
         p_xgb = float(xgb.predict_proba(x)[0, 1])
         p_lgbm = float(lgbm.predict_proba(x)[0, 1])
-        lower = max(0.0, min(p_xgb, p_lgbm))
-        upper = min(1.0, max(p_xgb, p_lgbm))
+        lower, upper = _confidence_interval(p_xgb, p_lgbm)
 
         # SHAP attributions explain the headline (5-day) XGBoost model, the
         # primary learner, so the explanation matches the dominant signal.

@@ -269,9 +269,12 @@ This is an honest accounting, not a wishlist:
   are database-agnostic, so production can swap to Postgres by changing `DATABASE_URL`
   with no schema changes.
 - **No Docker containerization yet.** The app runs directly via `uvicorn` / `npm run dev`.
-- **No automated test suite.** Verification throughout development has been manual,
-  live, end-to-end testing against the running backend (real signup/login, real analysis
-  runs, real drift reports) rather than unit/integration tests.
+- **Partial test coverage.** A `pytest` suite covers the Judge's pure logic
+  (consistency scoring, verdict gating, risk factor, LLM guardrails), the
+  forecaster's direction/confidence-interval mapping, and the auth + history
+  endpoints (via a TestClient on a throwaway SQLite DB). The full multi-agent
+  pipeline and live integrations (Groq, yfinance, SEC, NewsAPI) are still
+  verified manually/end-to-end rather than in CI.
 - **Single-machine deployment only.** Not yet hosted; backend and frontend run locally.
 - **Forecaster is intentionally modest.** Short-horizon equity direction is near
   random; the system discloses this (5-day AUC ~0.52) rather than inflating it.
