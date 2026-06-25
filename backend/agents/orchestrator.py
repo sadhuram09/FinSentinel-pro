@@ -34,11 +34,15 @@ from backend.schemas import (
     AnalysisRequest,
     AnalysisResponse,
     AnalystReport,
+    EvidenceSource,
     ForecastReport,
     JudgeVerdict,
+    RagRetrieval,
+    RetrievalTier,
     RiskReport,
     SentimentReport,
 )
+from rag.retriever import retrieve as rag_retrieve
 
 
 class AnalysisState(TypedDict, total=False):
@@ -57,7 +61,13 @@ class AnalysisState(TypedDict, total=False):
     forecast_report: ForecastReport
     risk_report: RiskReport
     sentiment_report: SentimentReport
+    rag_retrieval: RagRetrieval
     judge_verdict: JudgeVerdict
+
+
+# Fixed retrieval query: surfaces the qualitative themes a price model can't see
+# (growth, competitive position, enumerated risks) to corroborate the forecast.
+RAG_QUERY_TEMPLATE = "{ticker} revenue growth risk factors competitive position"
 
 
 def fetch_node(state: AnalysisState) -> dict:
@@ -92,13 +102,33 @@ def sentiment_node(state: AnalysisState) -> dict:
     return {"sentiment_report": run_sentiment_agent(state["ticker"])}
 
 
+def rag_node(state: AnalysisState) -> dict:
+    """Retrieve 10-K evidence for the ticker (parallel branch).
+
+    Lazily ingests the filing on first use, then maps the retriever's dataclass
+    into the API schema. Independent of market_data, so it fans out alongside
+    the other agents.
+    """
+    ticker = state["ticker"]
+    result = rag_retrieve(ticker, RAG_QUERY_TEMPLATE.format(ticker=ticker))
+    retrieval = RagRetrieval(
+        query=result.query,
+        evidence_sources=[EvidenceSource(**e) for e in result.evidence],
+        retrieval_confidence=result.retrieval_confidence,
+        confidence_tier=RetrievalTier(result.confidence_tier),
+        note=result.note,
+    )
+    return {"rag_retrieval": retrieval}
+
+
 def judge_node(state: AnalysisState) -> dict:
-    """Fan-in: adjudicate using all four upstream reports."""
+    """Fan-in: adjudicate using all five upstream reports."""
     verdict = run_judge_agent(
         analyst=state["analyst_report"],
         forecast=state["forecast_report"],
         risk=state["risk_report"],
         sentiment=state["sentiment_report"],
+        rag=state["rag_retrieval"],
     )
     return {"judge_verdict": verdict}
 
@@ -111,11 +141,12 @@ def _build_graph():
     graph.add_node("forecast", forecast_node)
     graph.add_node("risk", risk_node)
     graph.add_node("sentiment", sentiment_node)
+    graph.add_node("rag", rag_node)
     graph.add_node("judge", judge_node)
 
     graph.add_edge(START, "fetch")
-    # Fan out from the single fetch entry point to the four parallel agents.
-    for branch in ("analyst", "forecast", "risk", "sentiment"):
+    # Fan out from the single fetch entry point to the five parallel agents.
+    for branch in ("analyst", "forecast", "risk", "sentiment", "rag"):
         graph.add_edge("fetch", branch)
         # Fan in: judge waits for every branch before running.
         graph.add_edge(branch, "judge")
@@ -143,6 +174,7 @@ def run_analysis(request: AnalysisRequest) -> AnalysisResponse:
     forecast = final_state["forecast_report"]
     risk = final_state["risk_report"]
     sentiment = final_state["sentiment_report"]
+    rag = final_state["rag_retrieval"]
     judge_verdict = final_state["judge_verdict"]
 
     return AnalysisResponse(
@@ -156,5 +188,8 @@ def run_analysis(request: AnalysisRequest) -> AnalysisResponse:
         forecast=forecast,
         risk_report=risk,
         sentiment_report=sentiment,
+        evidence_sources=rag.evidence_sources,
+        retrieval_confidence=rag.retrieval_confidence,
+        confidence_tier=rag.confidence_tier,
         judge_verdict=judge_verdict,
     )

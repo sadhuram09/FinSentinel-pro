@@ -26,6 +26,8 @@ from backend.schemas import (
     AnalystReport,
     ForecastReport,
     JudgeVerdict,
+    RagRetrieval,
+    RetrievalTier,
     RiskReport,
     RiskTier,
     SentimentReport,
@@ -98,6 +100,15 @@ GROQ_SYSTEM_PROMPT = (
     "NEVER write that low or medium risk increases/boosts/raises confidence or "
     "trust, not even hypothetically ('would normally increase trust'). At most "
     "say it 'does not reduce' or 'leaves trust unchanged'.\n"
+    "- DOCUMENT EVIDENCE has three tiers; match your language to the stated tier "
+    "exactly. STRONG: you may cite the excerpts by section (e.g. 'Risk Factors') "
+    "as support for or contradiction of the forecast direction. MODERATE: refer "
+    "to the excerpts only as 'partial' or 'directionally relevant' context — do "
+    "NOT present them as solid, strong, or conclusive support, and do NOT call "
+    "them insufficient. INSUFFICIENT: write that document evidence was "
+    "insufficient and do NOT cite, invent, paraphrase, or imply any specific "
+    "filing content. Never claim a tier other than the one given, and never "
+    "fabricate evidence you were not shown.\n"
     "- Frame everything as agreement/disagreement between agents and as "
     "model-reported confidence. Describe what was measured, not what will happen."
 )
@@ -255,12 +266,57 @@ def _fallback_reasoning(
     )
 
 
+_EVIDENCE_SNIPPET_CHARS = 280
+_EVIDENCE_MAX_CHUNKS = 3
+
+
+def _format_evidence_block(rag: RagRetrieval) -> str:
+    """Render the 10-K evidence for the prompt, with language gated by the tier.
+
+    Three regimes, so the model's wording matches the actual match quality:
+      * INSUFFICIENT — withhold the snippets entirely and tell the model the
+        evidence was insufficient. It cannot cite what it was never shown, which
+        structurally prevents fabricated document confidence.
+      * MODERATE — pass the snippets but instruct the model to treat them as
+        partial / directionally relevant, NOT as solid support.
+      * STRONG — pass the snippets and invite confident citation by section.
+    """
+    if rag.confidence_tier == RetrievalTier.INSUFFICIENT or not rag.evidence_sources:
+        return (
+            "Document evidence (10-K): INSUFFICIENT. The retrieval returned no "
+            f"sufficiently relevant excerpts (top similarity "
+            f"{rag.retrieval_confidence:.2f}). State that document evidence was "
+            "insufficient; do NOT cite or infer any specific filing content."
+        )
+
+    if rag.confidence_tier == RetrievalTier.MODERATE:
+        header = (
+            f"Document evidence (10-K): MODERATE (top similarity "
+            f"{rag.retrieval_confidence:.2f}). Treat the excerpts below as only "
+            "PARTIAL / directionally relevant context — describe them as partial "
+            "and do NOT present them as solid or conclusive support:"
+        )
+    else:  # STRONG
+        header = (
+            f"Document evidence (10-K): STRONG (top similarity "
+            f"{rag.retrieval_confidence:.2f}). You may cite these by section as "
+            "support for or contradiction of the forecast direction:"
+        )
+
+    lines = [header]
+    for e in rag.evidence_sources[:_EVIDENCE_MAX_CHUNKS]:
+        snippet = " ".join(e.snippet[:_EVIDENCE_SNIPPET_CHARS].split())
+        lines.append(f"  - [{e.section}, sim={e.similarity_score:.2f}] {snippet}")
+    return "\n".join(lines)
+
+
 def _generate_override_reasoning(
     verdict: Verdict,
     consistency_score: float,
     flags: list[str],
     risk_tier: str,
     sentiment_label: str,
+    evidence_block: str,
 ) -> str:
     """Ask a Groq-hosted LLM to justify the verdict in 2-3 plain-English sentences.
 
@@ -287,6 +343,7 @@ def _generate_override_reasoning(
         f"Risk flags: {flag_text} — these are confidence / data-quality signals derived "
         "from the model's own internal uncertainty (e.g. wide confidence interval, "
         "near-coin-flip probability). They do not measure real-world outcomes.\n"
+        f"{evidence_block}\n"
     )
 
     try:
@@ -327,14 +384,17 @@ def run_judge_agent(
     forecast: ForecastReport,
     risk: RiskReport,
     sentiment: SentimentReport,
+    rag: RagRetrieval,
 ) -> JudgeVerdict:
-    """Adjudicate a forecast against the analyst, risk and sentiment reports.
+    """Adjudicate a forecast against the analyst, risk, sentiment and RAG reports.
 
     Args:
         analyst: The descriptive technical/fundamental read of the asset.
         forecast: The predictive call (with confidence interval) to adjudicate.
-        risk: The downside/volatility profile (contributes a directional lean).
+        risk: The downside/volatility profile (a confidence modifier).
         sentiment: The recent news polarity (an independent directional signal).
+        rag: 10-K evidence + retrieval confidence; cited in the reasoning when
+            strong, and explicitly called insufficient when weak.
 
     Returns:
         A :class:`JudgeVerdict` with the consistency score, flags, an
@@ -355,6 +415,7 @@ def run_judge_agent(
         flags,
         risk_tier=risk.risk_tier.value,
         sentiment_label=sentiment.sentiment_label.value,
+        evidence_block=_format_evidence_block(rag),
     )
 
     return JudgeVerdict(

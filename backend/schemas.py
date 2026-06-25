@@ -202,6 +202,46 @@ class SentimentReport(BaseModel):
     note: str | None = Field(None, description="Set when sentiment is degraded (e.g. no API key / no news).")
 
 
+class RetrievalTier(str, Enum):
+    """How much weight the judge should put on the retrieved 10-K evidence.
+
+    A vector store always returns its nearest chunks, so a single boolean
+    cannot distinguish "solid support" from "loosely related" from "irrelevant".
+    Three bands let the judge's language match the actual match quality:
+
+      * STRONG (sim >= 0.60): cite specific sections/snippets as support.
+      * MODERATE (0.45 <= sim < 0.60): snippets are only partial / directionally
+        relevant, not solid corroboration.
+      * INSUFFICIENT (sim < 0.45): too weak to use; snippets are withheld.
+    """
+
+    STRONG = "strong"
+    MODERATE = "moderate"
+    INSUFFICIENT = "insufficient"
+
+
+class EvidenceSource(BaseModel):
+    """A single retrieved 10-K chunk used as evidence by the judge."""
+
+    section: str = Field(..., description="Source 10-K section, e.g. 'Risk Factors' or 'MD&A'.")
+    snippet: str = Field(..., description="The retrieved chunk text.")
+    similarity_score: float = Field(..., description="Cosine similarity to the query (1.0 = exact match).")
+
+
+class RagRetrieval(BaseModel):
+    """Output of the RAG node: 10-K evidence plus a tiered read on its strength."""
+
+    query: str
+    evidence_sources: list[EvidenceSource] = Field(default_factory=list)
+    retrieval_confidence: float = Field(
+        ..., description="Similarity of the top chunk (0.0 if nothing relevant retrieved)."
+    )
+    confidence_tier: RetrievalTier = Field(
+        ..., description="strong / moderate / insufficient, derived from the top-chunk similarity."
+    )
+    note: str | None = Field(None, description="Set when retrieval is degraded (no filing, weak match, etc.).")
+
+
 class AnalysisResponse(BaseModel):
     """Combined response returned by POST /analysis/run."""
 
@@ -215,6 +255,11 @@ class AnalysisResponse(BaseModel):
     forecast: ForecastReport
     risk_report: RiskReport
     sentiment_report: SentimentReport
+    evidence_sources: list[EvidenceSource] = Field(
+        default_factory=list, description="10-K chunks cited by the judge as evidence."
+    )
+    retrieval_confidence: float = Field(..., description="Top-chunk similarity from the RAG retrieval.")
+    confidence_tier: RetrievalTier = Field(..., description="strong / moderate / insufficient evidence.")
     judge_verdict: JudgeVerdict
 
 
