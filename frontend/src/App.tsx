@@ -6,6 +6,7 @@
 import { BrowserRouter, Route, Routes } from "react-router-dom";
 
 import DocumentTexture from "./components/ui/DocumentTexture";
+import Analysis from "./pages/Analysis";
 import Auth from "./pages/Auth";
 import Dashboard from "./pages/Dashboard";
 import Landing from "./pages/Landing";
@@ -20,6 +21,7 @@ function App() {
         <Route path="/login" element={<Auth />} />
         <Route path="/signup" element={<Auth />} />
         <Route path="/dashboard" element={<Dashboard />} />
+        <Route path="/analysis/:id" element={<Analysis />} />
       </Routes>
     </BrowserRouter>
   );

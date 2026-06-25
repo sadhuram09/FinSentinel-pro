@@ -26,6 +26,8 @@ interface EvidenceCardProps {
   style?: CSSProperties;
   /** Smaller padding/type and no auto micro-label — for dense rows of cards. */
   compact?: boolean;
+  /** Override the micro-label. Pass "" to hide it; omit for "evidence · {level}". */
+  label?: string;
 }
 
 const OPACITY: Record<ConfidenceLevel, number> = {
@@ -52,6 +54,7 @@ export default function EvidenceCard({
   className = "",
   style,
   compact = false,
+  label,
 }: EvidenceCardProps) {
   const rotation = seededRotation(id);
   const isLow = confidenceLevel === "low";
@@ -86,9 +89,9 @@ export default function EvidenceCard({
       >
         {children}
       </div>
-      {!compact && (
+      {!compact && label !== "" && (
         <div className="mt-3 font-mono text-[10px] uppercase tracking-[0.16em] text-ink/45">
-          evidence · {confidenceLevel}
+          {label ?? `evidence · ${confidenceLevel}`}
         </div>
       )}
     </div>
