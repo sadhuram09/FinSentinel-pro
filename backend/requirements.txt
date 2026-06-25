@@ -19,6 +19,7 @@ chromadb>=0.5
 sentence-transformers>=2.7
 langchain-text-splitters>=0.2
 beautifulsoup4>=4.12
+ftfy>=6.2
 mlflow>=2.10
 evidently>=0.4
 matplotlib>=3.7

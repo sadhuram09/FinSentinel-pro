@@ -27,7 +27,13 @@ router = APIRouter(prefix="/analysis", tags=["analysis"])
 def _save_history(
     db: Session, user_id: int, request: AnalysisRequest, response: AnalysisResponse
 ) -> int | None:
-    """Persist a completed run to the user's history; return its id (best-effort)."""
+    """Persist a completed run to the user's history; return its id (best-effort).
+
+    The row id is auto-assigned on insert, but ``response.id`` (and therefore the
+    stored ``result_json``) needs that id. So we insert, read the id back, set it
+    on the response, and re-dump the JSON — making the stored copy self-consistent
+    with the row id served by /history and /history/{id}.
+    """
     try:
         record = AnalysisHistory(
             user_id=user_id,
@@ -40,6 +46,10 @@ def _save_history(
         db.add(record)
         db.commit()
         db.refresh(record)
+
+        response.id = record.id
+        record.result_json = response.model_dump(mode="json")  # now includes the id
+        db.commit()
         return record.id
     except Exception:  # noqa: BLE001 - a history write must not fail the analysis
         logger.exception("Failed to persist analysis history for user %s.", user_id)

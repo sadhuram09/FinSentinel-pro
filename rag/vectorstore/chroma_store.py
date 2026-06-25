@@ -16,6 +16,7 @@ from pathlib import Path
 
 import chromadb
 from chromadb.utils import embedding_functions
+from ftfy import fix_text
 
 from rag.ingestion.chunker import Chunk
 
@@ -58,6 +59,14 @@ def get_collection(ticker: str):
         embedding_function=_get_embedding_fn(),
         metadata={"hnsw:space": "cosine"},
     )
+
+
+def delete_ticker(ticker: str) -> None:
+    """Drop a ticker's collection so it can be re-ingested from scratch."""
+    try:
+        _get_client().delete_collection(_collection_name(ticker))
+    except Exception:  # noqa: BLE001 - collection may not exist; nothing to drop
+        pass
 
 
 def has_documents(ticker: str) -> bool:
@@ -103,7 +112,11 @@ def query(ticker: str, query_text: str, k: int = 5) -> list[dict]:
         results.append(
             {
                 "section": meta.get("section", "unknown"),
-                "snippet": doc,
+                # Repair mojibake on read: Chroma's native layer can decode stored
+                # UTF-8 via the host ANSI codepage (e.g. cp1252 under uvicorn on
+                # Windows), turning ' into "â€™". ftfy reverses that deterministic
+                # double-encoding and is a no-op on already-clean text.
+                "snippet": fix_text(doc),
                 "similarity_score": round(1.0 - float(dist), 4),
             }
         )

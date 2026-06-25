@@ -23,6 +23,7 @@ import os
 from datetime import datetime, timedelta, timezone
 
 import requests
+from ftfy import fix_text
 
 from backend.schemas import HeadlineSentiment, SentimentLabel, SentimentReport
 
@@ -82,8 +83,13 @@ def _fetch_headlines(ticker: str, api_key: str) -> list[str]:
         timeout=10,
     )
     resp.raise_for_status()
+    # NewsAPI returns UTF-8 JSON; pin the encoding so requests never guesses a
+    # legacy codepage (which turns smart quotes/dashes into mojibake).
+    resp.encoding = "utf-8"
     articles = resp.json().get("articles", [])
-    return [a["title"] for a in articles if a.get("title")]
+    # ftfy repairs any residual mojibake (some publishers ship already-mangled
+    # titles); it is a no-op on clean text.
+    return [fix_text(a["title"]) for a in articles if a.get("title")]
 
 
 def _signed_score(label: str, confidence: float) -> tuple[SentimentLabel, float]:
