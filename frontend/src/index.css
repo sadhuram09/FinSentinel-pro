@@ -1,0 +1,51 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html {
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    text-rendering: optimizeLegibility;
+  }
+
+  body {
+    margin: 0;
+    /* The reading-room ground. DocumentTexture paints over this. */
+    @apply bg-ink font-sans text-paper;
+  }
+}
+
+@layer components {
+  /* Soft, DIRECTIONAL, physical-card shadow — offset down-right, a cast shadow,
+     never a glow. Opacity bumped so it stays visible against the dark ground. */
+  .shadow-card {
+    box-shadow:
+      4px 8px 16px rgba(0, 0, 0, 0.45),
+      2px 3px 6px rgba(0, 0, 0, 0.30);
+  }
+
+  /* Dog-ear: a folded paper corner in the bottom-right. A solid triangle of the
+     fold's (slightly darker) underside, clipped to the corner, casting a small
+     shadow up-left onto the card so it reads as physically lifted. */
+  .dog-ear::after {
+    content: "";
+    position: absolute;
+    right: 0;
+    bottom: 0;
+    width: 24px;
+    height: 24px;
+    background: #e3dac4;
+    clip-path: polygon(100% 0, 0 100%, 100% 100%);
+    box-shadow: -3px -3px 4px rgba(0, 0, 0, 0.22);
+    border-bottom-right-radius: 3px;
+  }
+
+  /* Margin-note voice: a more casual Fraunces italic. */
+  .note-hand {
+    font-family: "Fraunces", serif;
+    font-style: italic;
+    font-weight: 400;
+    font-optical-sizing: auto;
+  }
+}
