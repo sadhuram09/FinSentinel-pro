@@ -10,10 +10,12 @@
 import { motion } from "framer-motion";
 
 export type Verdict = "Approved" | "Conflicted" | "Rejected";
+type Size = "md" | "sm";
 
 interface VerdictStampProps {
   verdict: Verdict;
   className?: string;
+  size?: Size;
 }
 
 // Map each verdict to its semantic colour (matches tailwind verdict-* tokens).
@@ -23,7 +25,14 @@ const VERDICT_COLOR: Record<Verdict, string> = {
   Rejected: "#E5484D",
 };
 
-export default function VerdictStamp({ verdict, className = "" }: VerdictStampProps) {
+// Per-size sizing: border weight, padding and type. "sm" is for dense lists
+// (e.g. the dashboard's recent-reads rows); "md" is the standalone mark.
+const SIZE_CLASS: Record<Size, string> = {
+  md: "border-[5px] px-5 py-2 text-xl tracking-[0.2em]",
+  sm: "border-[3px] px-2.5 py-0.5 text-[11px] tracking-[0.14em]",
+};
+
+export default function VerdictStamp({ verdict, className = "", size = "md" }: VerdictStampProps) {
   const color = VERDICT_COLOR[verdict];
 
   return (
@@ -42,7 +51,7 @@ export default function VerdictStamp({ verdict, className = "" }: VerdictStampPr
         // Slightly inky, uneven impression.
         boxShadow: `inset 0 0 0 1px ${color}33`,
       }}
-      className={`inline-flex select-none items-center border-[5px] px-5 py-2 font-mono text-xl font-bold uppercase tracking-[0.2em] ${className}`}
+      className={`inline-flex select-none items-center font-mono font-bold uppercase ${SIZE_CLASS[size]} ${className}`}
     >
       {verdict}
     </motion.div>

@@ -245,6 +245,10 @@ class RagRetrieval(BaseModel):
 class AnalysisResponse(BaseModel):
     """Combined response returned by POST /analysis/run."""
 
+    # Persisted analysis-history record id, set by the router after the run is
+    # saved. It is the same id used by /history and /history/{id}, so clients
+    # can navigate straight to the stored analysis. None if persistence failed.
+    id: int | None = None
     ticker: str
     model_version: str
     prediction: Direction

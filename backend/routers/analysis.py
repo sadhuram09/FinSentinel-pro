@@ -24,23 +24,27 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/analysis", tags=["analysis"])
 
 
-def _save_history(db: Session, user_id: int, request: AnalysisRequest, response: AnalysisResponse) -> None:
-    """Persist a completed run to the user's history (best-effort)."""
+def _save_history(
+    db: Session, user_id: int, request: AnalysisRequest, response: AnalysisResponse
+) -> int | None:
+    """Persist a completed run to the user's history; return its id (best-effort)."""
     try:
-        db.add(
-            AnalysisHistory(
-                user_id=user_id,
-                ticker=response.ticker,
-                lookback_period=request.lookback_period,
-                prediction=response.prediction.value,
-                verdict=response.judge_verdict.verdict.value,
-                result_json=response.model_dump(mode="json"),
-            )
+        record = AnalysisHistory(
+            user_id=user_id,
+            ticker=response.ticker,
+            lookback_period=request.lookback_period,
+            prediction=response.prediction.value,
+            verdict=response.judge_verdict.verdict.value,
+            result_json=response.model_dump(mode="json"),
         )
+        db.add(record)
         db.commit()
+        db.refresh(record)
+        return record.id
     except Exception:  # noqa: BLE001 - a history write must not fail the analysis
         logger.exception("Failed to persist analysis history for user %s.", user_id)
         db.rollback()
+        return None
 
 
 @router.post("/run", response_model=AnalysisResponse, summary="Run full ticker analysis (auth required)")
@@ -65,5 +69,6 @@ def run(
         logger.exception("Analysis failed for ticker %s", request.ticker)
         raise HTTPException(status_code=500, detail="Internal analysis error.") from exc
 
-    _save_history(db, current_user.id, request, response)
+    # Surface the saved record id so the client can navigate to /analysis/:id.
+    response.id = _save_history(db, current_user.id, request, response)
     return response
