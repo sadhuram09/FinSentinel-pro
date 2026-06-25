@@ -30,6 +30,7 @@ from backend.agents.judge_agent import run_judge_agent
 from backend.agents.risk_agent import run_risk_agent
 from backend.agents.sentiment_agent import run_sentiment_agent
 from backend.data.market_data import MarketData, fetch_market_data
+from backend.mlops.inference_log import log_inference
 from backend.schemas import (
     AnalysisRequest,
     AnalysisResponse,
@@ -176,6 +177,9 @@ def run_analysis(request: AnalysisRequest) -> AnalysisResponse:
     sentiment = final_state["sentiment_report"]
     rag = final_state["rag_retrieval"]
     judge_verdict = final_state["judge_verdict"]
+
+    # Log the scored feature row for drift monitoring (best-effort, never raises).
+    log_inference(analyst.ticker, analyst.technicals.model_dump())
 
     return AnalysisResponse(
         ticker=analyst.ticker,

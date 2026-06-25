@@ -12,7 +12,7 @@ import logging
 from dotenv import load_dotenv
 from fastapi import FastAPI
 
-from backend.routers import analysis
+from backend.routers import analysis, mlops
 
 # Load environment variables from .env before anything reads config.
 load_dotenv()
@@ -30,6 +30,7 @@ app = FastAPI(
 )
 
 app.include_router(analysis.router)
+app.include_router(mlops.router)
 
 
 @app.get("/health", tags=["meta"], summary="Liveness probe")

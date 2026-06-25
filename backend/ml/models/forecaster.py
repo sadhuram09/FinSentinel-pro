@@ -28,6 +28,7 @@ import logging
 from pathlib import Path
 
 import joblib
+import mlflow
 import pandas as pd
 from lightgbm import LGBMClassifier
 from xgboost import XGBClassifier
@@ -266,17 +267,75 @@ class StackedForecaster:
         )
 
 
-# Load persisted boosters once at import. None means "no trained model on disk".
-_PRETRAINED: StackedForecaster | None = StackedForecaster.load_pretrained()
-if _PRETRAINED is not None:
-    logger.info("Loaded pretrained forecaster '%s' from %s", _PRETRAINED.model_version, MODELS_DIR)
-else:
+class EnsembleModel(mlflow.pyfunc.PythonModel):
+    """MLflow pyfunc wrapper so the whole multi-horizon ensemble is one registry model.
+
+    Holding both horizons' boosters in a single registered model means one
+    Production alias governs the entire forecaster. ``predict`` returns per-
+    horizon P(up); the forecaster unwraps this back to the raw boosters so SHAP
+    still operates on the underlying trees.
+    """
+
+    def __init__(
+        self,
+        models: dict[int, tuple] | None = None,
+        feature_columns: list[str] | None = None,
+        model_version: str = MODEL_VERSION,
+    ) -> None:
+        self.models = models or {}
+        self.feature_columns = feature_columns or FEATURE_COLUMNS
+        self.model_version = model_version
+
+    def predict(self, context, model_input, params=None):  # noqa: D102 - pyfunc contract
+        x = model_input[self.feature_columns]
+        out = {}
+        for horizon, (xgb, lgbm) in self.models.items():
+            out[f"prob_up_h{horizon}"] = (
+                XGB_WEIGHT * xgb.predict_proba(x)[:, 1] + LGBM_WEIGHT * lgbm.predict_proba(x)[:, 1]
+            )
+        return pd.DataFrame(out, index=model_input.index)
+
+
+def _load_from_registry() -> "StackedForecaster | None":
+    """Load the ``@production`` ensemble from the MLflow registry, or None."""
+    from backend.mlops import registry
+
+    if not registry.registry_initialised():
+        return None
+    try:
+        registry.configure()
+        uri = f"models:/{registry.MODEL_NAME}@{registry.PRODUCTION_ALIAS}"
+        impl = mlflow.pyfunc.load_model(uri).unwrap_python_model()
+        forecaster = StackedForecaster(model_version=impl.model_version)
+        forecaster._models = impl.models
+        return forecaster
+    except Exception:  # noqa: BLE001 - no Production alias yet, or load failure
+        logger.info("No @production model in registry (or load failed); using fallback.")
+        return None
+
+
+def _initialise_forecaster() -> "StackedForecaster | None":
+    """Resolve the active forecaster: registry Production -> local joblib -> none."""
+    from_registry = _load_from_registry()
+    if from_registry is not None:
+        logger.info("Loaded forecaster '%s' from MLflow registry (@production).", from_registry.model_version)
+        return from_registry
+
+    from_disk = StackedForecaster.load_pretrained()
+    if from_disk is not None:
+        logger.info("Loaded pretrained forecaster '%s' from %s.", from_disk.model_version, MODELS_DIR)
+        return from_disk
+
     logger.warning(
-        "No persisted models found in %s. Falling back to per-request fitting "
-        "(scaffold mode); run `python scripts/train_models.py` to train and "
-        "persist a production model.",
+        "No registry @production model and no persisted models in %s. Falling back "
+        "to per-request fitting (scaffold mode); run `python scripts/train_models.py`.",
         MODELS_DIR,
     )
+    return None
+
+
+# Resolve the active model once at import.
+_PRETRAINED: StackedForecaster | None = _initialise_forecaster()
 
 
 def forecast(ticker: str, features: pd.DataFrame) -> ForecastReport:

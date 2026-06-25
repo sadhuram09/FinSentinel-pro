@@ -15,3 +15,11 @@ mlruns/
 
 # Persisted RAG vector store (ChromaDB) — large, regenerable from SEC filings.
 /rag_store/
+
+# MLOps local artifacts — all regenerable, none belong in git.
+# (mlruns/ is already ignored above for MLflow artifacts.)
+/mlartifacts/
+mlflow.db
+*.sqlite
+*.db
+/drift_reports/

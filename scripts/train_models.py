@@ -40,14 +40,21 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 import joblib
-import numpy as np
-import pandas as pd
-import yfinance as yf
-from sklearn.metrics import brier_score_loss, f1_score, roc_auc_score
+import matplotlib
+
+matplotlib.use("Agg")  # headless: render plots to files, never to a display
+import matplotlib.pyplot as plt  # noqa: E402
+import numpy as np  # noqa: E402
+import pandas as pd  # noqa: E402
+import shap  # noqa: E402
+import yfinance as yf  # noqa: E402
+from sklearn.metrics import brier_score_loss, f1_score, roc_auc_score  # noqa: E402
 
 # Make the project root importable when run as a plain script.
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
+
+import mlflow  # noqa: E402
 
 from backend.ml.features.technical import compute_technical_features  # noqa: E402
 from backend.ml.models.forecaster import (  # noqa: E402
@@ -56,14 +63,20 @@ from backend.ml.models.forecaster import (  # noqa: E402
     LGBM_WEIGHT,
     MODEL_VERSION,
     XGB_WEIGHT,
+    EnsembleModel,
     build_lgbm,
     build_xgb,
     model_path,
 )
+from backend.mlops import registry  # noqa: E402
 
 DEFAULT_TICKERS = ["AAPL", "MSFT", "GOOGL", "TSLA"]
 DEFAULT_YEARS = 7  # comfortably above the 5-year minimum
 VALIDATION_FRACTION = 0.20  # most-recent 20% of the timeline held out
+
+# Where the drift detector reads the training feature distribution from.
+FEATURE_BASELINE_PATH = PROJECT_ROOT / "models" / "feature_baseline.csv"
+SHAP_SAMPLE = 300  # rows sampled for the (relatively expensive) SHAP summary plot
 
 
 def fetch_ohlcv(ticker: str, years: int) -> pd.DataFrame:
@@ -131,8 +144,8 @@ def _metrics(y_true: np.ndarray, proba: np.ndarray) -> dict[str, float]:
     }
 
 
-def train_horizon(pooled: pd.DataFrame, horizon: int, models_dir: Path) -> None:
-    """Train, validate, report and persist the ensemble for one horizon."""
+def train_horizon(pooled: pd.DataFrame, horizon: int, models_dir: Path, version: str) -> dict:
+    """Train, validate, persist and return the ensemble + metrics for one horizon."""
     labelled = make_labels(pooled, horizon)
     train, val, cutoff = time_series_split(labelled)
 
@@ -148,16 +161,17 @@ def train_horizon(pooled: pd.DataFrame, horizon: int, models_dir: Path) -> None:
     p_lgbm = lgbm.predict_proba(x_val)[:, 1]
     p_ens = XGB_WEIGHT * p_xgb + LGBM_WEIGHT * p_lgbm
 
-    m_xgb = _metrics(y_val, p_xgb)
-    m_lgbm = _metrics(y_val, p_lgbm)
-    m_ens = _metrics(y_val, p_ens)
+    metrics = {
+        "xgboost": _metrics(y_val, p_xgb),
+        "lightgbm": _metrics(y_val, p_lgbm),
+        "ensemble": _metrics(y_val, p_ens),
+    }
 
     print(f"\n=== Horizon {horizon}d ===")
     print(f"  train rows: {len(train):>6}  | val rows: {len(val):>6}  | cutoff: {pd.Timestamp(cutoff).date()}")
     print(f"  val up-rate: {y_val.mean():.3f}")
-    header = f"  {'model':<10} {'AUC':>7} {'F1':>7} {'Brier':>8}"
-    print(header)
-    for name, m in (("xgboost", m_xgb), ("lightgbm", m_lgbm), ("ensemble", m_ens)):
+    print(f"  {'model':<10} {'AUC':>7} {'F1':>7} {'Brier':>8}")
+    for name, m in metrics.items():
         print(f"  {name:<10} {m['auc']:>7.4f} {m['f1']:>7.4f} {m['brier']:>8.4f}")
 
     bundle = {
@@ -165,14 +179,52 @@ def train_horizon(pooled: pd.DataFrame, horizon: int, models_dir: Path) -> None:
         "lgbm": lgbm,
         "feature_columns": FEATURE_COLUMNS,
         "horizon": horizon,
-        "model_version": f"{MODEL_VERSION}-pooled-{datetime.now():%Y%m%d}",
+        "model_version": version,
         "tickers": sorted(pooled["ticker"].unique().tolist()),
         "trained_at": datetime.now().isoformat(timespec="seconds"),
-        "validation_metrics": {"xgboost": m_xgb, "lightgbm": m_lgbm, "ensemble": m_ens},
+        "validation_metrics": metrics,
     }
     out = model_path(horizon, models_dir)
     joblib.dump(bundle, out)
     print(f"  saved -> {out}")
+
+    return {"xgb": xgb, "lgbm": lgbm, "metrics": metrics, "x_val": x_val, "horizon": horizon}
+
+
+def feature_importance_plot(xgb, horizon: int, out_dir: Path) -> Path:
+    """Save a horizontal bar chart of XGBoost gain importances for one horizon."""
+    importances = xgb.feature_importances_
+    order = np.argsort(importances)
+    fig, ax = plt.subplots(figsize=(7, 4))
+    ax.barh([FEATURE_COLUMNS[i] for i in order], importances[order], color="#4C72B0")
+    ax.set_title(f"XGBoost feature importance (horizon {horizon}d)")
+    ax.set_xlabel("importance (gain)")
+    fig.tight_layout()
+    path = out_dir / f"feature_importance_h{horizon}.png"
+    fig.savefig(path, dpi=120)
+    plt.close(fig)
+    return path
+
+
+def shap_summary_plot(xgb, x_val: pd.DataFrame, horizon: int, out_dir: Path) -> Path:
+    """Save a SHAP summary (beeswarm) plot of the XGBoost model for one horizon."""
+    sample = x_val.sample(min(SHAP_SAMPLE, len(x_val)), random_state=42)
+    explainer = shap.TreeExplainer(xgb)
+    shap_values = explainer.shap_values(sample)
+    plt.figure()
+    shap.summary_plot(shap_values, sample, show=False)
+    path = out_dir / f"shap_summary_h{horizon}.png"
+    plt.tight_layout()
+    plt.savefig(path, dpi=120, bbox_inches="tight")
+    plt.close()
+    return path
+
+
+def save_feature_baseline(pooled: pd.DataFrame) -> Path:
+    """Persist the training feature distribution as the drift-detection baseline."""
+    FEATURE_BASELINE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    pooled[FEATURE_COLUMNS].to_csv(FEATURE_BASELINE_PATH, index=False)
+    return FEATURE_BASELINE_PATH
 
 
 def main() -> None:
@@ -191,13 +243,79 @@ def main() -> None:
         parser.error("Need at least 5 years of history for a meaningful time-series split.")
 
     args.models_dir.mkdir(parents=True, exist_ok=True)
+    version = f"{MODEL_VERSION}-pooled-{datetime.now():%Y%m%d-%H%M%S}"
 
     print(f"Pooling {len(args.tickers)} tickers over ~{args.years}y: {', '.join(args.tickers)}")
     pooled = build_pooled_dataset(args.tickers, args.years)
     print(f"Pooled dataset: {len(pooled)} feature rows across {pooled['ticker'].nunique()} tickers.")
 
-    for horizon in HORIZONS:
-        train_horizon(pooled, horizon, args.models_dir)
+    # Point MLflow at the local SQLite store and our experiment.
+    registry.configure()
+    mlflow.set_experiment(experiment_id=registry.ensure_experiment())
+
+    with mlflow.start_run(run_name=version) as run:
+        # --- params: what defined this training run -------------------------
+        xgb_params = build_xgb().get_params()
+        lgbm_params = build_lgbm().get_params()
+        mlflow.log_params(
+            {
+                "model_type": "stacked-ensemble(xgboost+lightgbm)",
+                "tickers": ",".join(sorted(args.tickers)),
+                "n_tickers": pooled["ticker"].nunique(),
+                "years": args.years,
+                "date_start": str(pooled["date"].min().date()),
+                "date_end": str(pooled["date"].max().date()),
+                "n_rows": len(pooled),
+                "validation_fraction": VALIDATION_FRACTION,
+                "horizons": ",".join(str(h) for h in HORIZONS),
+                "feature_columns": ",".join(FEATURE_COLUMNS),
+                "xgb_weight": XGB_WEIGHT,
+                "lgbm_weight": LGBM_WEIGHT,
+                "xgb_n_estimators": xgb_params["n_estimators"],
+                "xgb_max_depth": xgb_params["max_depth"],
+                "xgb_learning_rate": xgb_params["learning_rate"],
+                "lgbm_n_estimators": lgbm_params["n_estimators"],
+                "lgbm_max_depth": lgbm_params["max_depth"],
+                "lgbm_learning_rate": lgbm_params["learning_rate"],
+                "model_version": version,
+            }
+        )
+
+        # --- train each horizon; log metrics + plots ------------------------
+        plot_dir = args.models_dir / "plots"
+        plot_dir.mkdir(parents=True, exist_ok=True)
+        all_models: dict[int, tuple] = {}
+        for horizon in HORIZONS:
+            res = train_horizon(pooled, horizon, args.models_dir, version)
+            all_models[horizon] = (res["xgb"], res["lgbm"])
+            # metrics: auc/f1/brier per model per horizon
+            for model_name, m in res["metrics"].items():
+                for metric_name, value in m.items():
+                    mlflow.log_metric(f"{metric_name}_{model_name}_h{horizon}", value)
+            # artifacts: SHAP summary + feature importance plots
+            mlflow.log_artifact(str(feature_importance_plot(res["xgb"], horizon, plot_dir)), "plots")
+            mlflow.log_artifact(str(shap_summary_plot(res["xgb"], res["x_val"], horizon, plot_dir)), "plots")
+
+        # --- artifact: feature baseline for drift detection -----------------
+        baseline = save_feature_baseline(pooled)
+        mlflow.log_artifact(str(baseline), "baseline")
+
+        # --- register the ensemble and stage it -----------------------------
+        ensemble = EnsembleModel(models=all_models, feature_columns=FEATURE_COLUMNS, model_version=version)
+        model_info = mlflow.pyfunc.log_model(
+            name="forecaster",
+            python_model=ensemble,
+            registered_model_name=registry.MODEL_NAME,
+        )
+        client = mlflow.MlflowClient()
+        new_version = model_info.registered_model_version
+        # MLflow 3 uses aliases (stages were removed): tag this version "staging".
+        client.set_registered_model_alias(registry.MODEL_NAME, registry.STAGING_ALIAS, new_version)
+
+        print(f"\nMLflow run_id   : {run.info.run_id}")
+        print(f"Registered model: {registry.MODEL_NAME} v{new_version} -> alias '@{registry.STAGING_ALIAS}'")
+        print(f"Tracking URI    : {registry.TRACKING_URI}")
+        print("Promote to production with: python scripts/promote_model.py")
 
     print(f"\nDone. Models written to {args.models_dir}")
 
