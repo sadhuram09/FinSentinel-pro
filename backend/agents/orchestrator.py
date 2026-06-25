@@ -1,24 +1,34 @@
-"""Orchestrator: a LangGraph state machine over the three agents.
+"""Orchestrator: a LangGraph state machine over the analysis agents.
 
-The pipeline is a linear graph — analyst -> forecast -> judge -> END — sharing
-one typed state object. Expressing it as a ``StateGraph`` (rather than plain
-function calls) makes the data flow explicit and auditable, and leaves room to
-add conditional edges later (e.g. short-circuit to END on a data-fetch failure,
-or loop back for a second forecast when the judge is Conflicted).
+Topology (fan-out / fan-in):
 
-Market data is fetched once in the analyst node and threaded through the state
-so the forecast node reuses it rather than hitting yfinance twice.
+                         ┌─> analyst ─┐
+                         ├─> forecast ┤
+    START ─> fetch ──────┼─> risk ────┼──> judge ─> END
+                         └─> sentiment┘
+
+``fetch`` is the single entry point: it downloads the ticker's market data once
+and stores it in shared state. From there the four analysis agents fan out and
+run in parallel — they are mutually independent (analyst/forecast/risk read the
+shared OHLCV; sentiment hits NewsAPI), so there is no reason to serialise them.
+``judge`` has an incoming edge from all four, so LangGraph runs it only after
+every branch has completed, and it then adjudicates using all four reports.
+
+Parallel nodes write disjoint state keys, so their concurrent state updates
+merge without conflict.
 """
 
 from __future__ import annotations
 
 from typing import TypedDict
 
-from langgraph.graph import END, StateGraph
+from langgraph.graph import END, START, StateGraph
 
 from backend.agents.analyst_agent import run_analyst_agent
 from backend.agents.forecast_agent import run_forecast_agent
 from backend.agents.judge_agent import run_judge_agent
+from backend.agents.risk_agent import run_risk_agent
+from backend.agents.sentiment_agent import run_sentiment_agent
 from backend.data.market_data import MarketData, fetch_market_data
 from backend.schemas import (
     AnalysisRequest,
@@ -26,16 +36,18 @@ from backend.schemas import (
     AnalystReport,
     ForecastReport,
     JudgeVerdict,
+    RiskReport,
+    SentimentReport,
 )
 
 
 class AnalysisState(TypedDict, total=False):
     """Shared state threaded through the analysis graph.
 
-    ``total=False`` because keys are populated progressively as nodes run:
-    the entry payload carries only ``ticker``/``lookback_period``; each node
-    contributes its own output. ``market_data`` is an internal carrier so the
-    single yfinance fetch is shared across nodes.
+    ``total=False`` because keys are populated progressively as nodes run: the
+    entry payload carries only ``ticker``/``lookback_period``; ``fetch`` adds
+    ``market_data`` (shared by the analyst/forecast/risk branches); each analysis
+    node contributes its own report; ``judge`` adds the verdict.
     """
 
     ticker: str
@@ -43,38 +55,70 @@ class AnalysisState(TypedDict, total=False):
     market_data: MarketData
     analyst_report: AnalystReport
     forecast_report: ForecastReport
+    risk_report: RiskReport
+    sentiment_report: SentimentReport
     judge_verdict: JudgeVerdict
 
 
-def analyst_node(state: AnalysisState) -> dict:
-    """Fetch market data (once) and run the analyst agent."""
+def fetch_node(state: AnalysisState) -> dict:
+    """Single entry point: fetch the ticker's market data once for the fan-out."""
     data = fetch_market_data(state["ticker"], period=state.get("lookback_period", "1y"))
-    report = run_analyst_agent(data)
-    return {"market_data": data, "analyst_report": report}
+    return {"market_data": data}
+
+
+def analyst_node(state: AnalysisState) -> dict:
+    """Descriptive technical/fundamental read (parallel branch)."""
+    return {"analyst_report": run_analyst_agent(state["market_data"])}
 
 
 def forecast_node(state: AnalysisState) -> dict:
-    """Run the forecast agent over the already-fetched market data."""
-    report = run_forecast_agent(state["market_data"])
-    return {"forecast_report": report}
+    """Predictive ensemble call (parallel branch)."""
+    return {"forecast_report": run_forecast_agent(state["market_data"])}
+
+
+def risk_node(state: AnalysisState) -> dict:
+    """Downside/volatility profile (parallel branch); reuses shared OHLCV, fetches SPY."""
+    data = state["market_data"]
+    report = run_risk_agent(
+        ticker=state["ticker"],
+        lookback_period=state.get("lookback_period", "1y"),
+        ohlcv=data.ohlcv,
+    )
+    return {"risk_report": report}
+
+
+def sentiment_node(state: AnalysisState) -> dict:
+    """News-sentiment read via NewsAPI + FinBERT (parallel branch)."""
+    return {"sentiment_report": run_sentiment_agent(state["ticker"])}
 
 
 def judge_node(state: AnalysisState) -> dict:
-    """Adjudicate the analyst and forecast reports."""
-    verdict = run_judge_agent(state["analyst_report"], state["forecast_report"])
+    """Fan-in: adjudicate using all four upstream reports."""
+    verdict = run_judge_agent(
+        analyst=state["analyst_report"],
+        forecast=state["forecast_report"],
+        risk=state["risk_report"],
+        sentiment=state["sentiment_report"],
+    )
     return {"judge_verdict": verdict}
 
 
 def _build_graph():
-    """Compile the analyst -> forecast -> judge -> END state graph."""
+    """Compile the fetch -> {analyst, forecast, risk, sentiment} -> judge graph."""
     graph = StateGraph(AnalysisState)
+    graph.add_node("fetch", fetch_node)
     graph.add_node("analyst", analyst_node)
     graph.add_node("forecast", forecast_node)
+    graph.add_node("risk", risk_node)
+    graph.add_node("sentiment", sentiment_node)
     graph.add_node("judge", judge_node)
 
-    graph.set_entry_point("analyst")
-    graph.add_edge("analyst", "forecast")
-    graph.add_edge("forecast", "judge")
+    graph.add_edge(START, "fetch")
+    # Fan out from the single fetch entry point to the four parallel agents.
+    for branch in ("analyst", "forecast", "risk", "sentiment"):
+        graph.add_edge("fetch", branch)
+        # Fan in: judge waits for every branch before running.
+        graph.add_edge(branch, "judge")
     graph.add_edge("judge", END)
 
     return graph.compile()
@@ -85,11 +129,11 @@ _GRAPH = _build_graph()
 
 
 def run_analysis(request: AnalysisRequest) -> AnalysisResponse:
-    """Run the full analyst -> forecast -> judge pipeline for one ticker.
+    """Run the full fan-out/fan-in pipeline for one ticker.
 
-    Invokes the compiled LangGraph with the request, then merges the node
-    outputs into the public :class:`AnalysisResponse`, lifting the headline
-    forecast fields to the top level and attaching the judge's verdict.
+    Invokes the compiled LangGraph, then merges the node outputs into the public
+    :class:`AnalysisResponse`, lifting the headline forecast fields to the top
+    level and attaching the risk, sentiment and judge results.
     """
     final_state: AnalysisState = _GRAPH.invoke(
         {"ticker": request.ticker, "lookback_period": request.lookback_period}
@@ -97,6 +141,8 @@ def run_analysis(request: AnalysisRequest) -> AnalysisResponse:
 
     analyst = final_state["analyst_report"]
     forecast = final_state["forecast_report"]
+    risk = final_state["risk_report"]
+    sentiment = final_state["sentiment_report"]
     judge_verdict = final_state["judge_verdict"]
 
     return AnalysisResponse(
@@ -108,5 +154,7 @@ def run_analysis(request: AnalysisRequest) -> AnalysisResponse:
         shap_explanation=forecast.shap_explanation,
         analyst=analyst,
         forecast=forecast,
+        risk_report=risk,
+        sentiment_report=sentiment,
         judge_verdict=judge_verdict,
     )

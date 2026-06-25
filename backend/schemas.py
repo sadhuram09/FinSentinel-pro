@@ -130,6 +130,78 @@ class JudgeVerdict(BaseModel):
     audit_id: str = Field(..., description="UUID4 uniquely identifying this adjudication for audit trails.")
 
 
+class RiskTier(str, Enum):
+    """Coarse risk bucket used by the judge to weight a forecast.
+
+    A directional call made on a fragile, high-volatility name deserves more
+    scrutiny than the same call on a stable one. Collapsing the risk metrics
+    into three tiers gives the judge a single lever without it having to
+    re-derive thresholds from raw statistics.
+    """
+
+    LOW = "Low"
+    MEDIUM = "Medium"
+    HIGH = "High"
+
+
+class RiskReport(BaseModel):
+    """Output of the risk agent: the asset's downside/volatility profile.
+
+    These metrics matter to the judge because a forecast's *consequence* depends
+    on the risk regime: the same probability of a down move is far more
+    dangerous in a name with fat left-tail losses and deep drawdowns.
+    """
+
+    ticker: str
+    lookback_period: str
+    var_95: float = Field(
+        ..., description="1-day historical VaR at 95% as a positive loss fraction (e.g. 0.03 = 3%)."
+    )
+    var_99: float = Field(..., description="1-day historical VaR at 99% (deeper tail) as a positive loss fraction.")
+    cvar_95: float = Field(
+        ..., description="Expected Shortfall at 95%: average loss *given* the worst 5% of days (>= VaR95)."
+    )
+    sharpe_ratio: float = Field(..., description="Annualised excess return per unit of total volatility.")
+    sortino_ratio: float = Field(..., description="Annualised excess return per unit of downside volatility only.")
+    max_drawdown: float = Field(..., description="Largest peak-to-trough decline over the window, positive fraction.")
+    beta: float = Field(..., description="Sensitivity to SPY: >1 amplifies market moves, <1 dampens them.")
+    risk_tier: RiskTier
+
+
+class SentimentLabel(str, Enum):
+    """Discrete sentiment polarity for a headline or an aggregate."""
+
+    POSITIVE = "positive"
+    NEGATIVE = "negative"
+    NEUTRAL = "neutral"
+
+
+class HeadlineSentiment(BaseModel):
+    """One headline scored by FinBERT."""
+
+    headline: str
+    label: SentimentLabel
+    score: float = Field(..., ge=-1.0, le=1.0, description="Signed confidence: +pos, -neg, 0 neutral.")
+
+
+class SentimentReport(BaseModel):
+    """Output of the sentiment agent: the recent news narrative around the asset.
+
+    News sentiment is an orthogonal signal to price/technicals: it can corroborate
+    a forecast (bullish forecast + bullish coverage) or flag a divergence the
+    judge should weigh (bullish forecast against a wave of negative headlines).
+    """
+
+    ticker: str
+    sentiment_score: float = Field(..., ge=-1.0, le=1.0, description="Aggregate polarity, -1 (bearish) to +1 (bullish).")
+    sentiment_label: SentimentLabel
+    headline_count: int = Field(..., description="Number of headlines analysed in the window.")
+    top_headlines: list[HeadlineSentiment] = Field(
+        default_factory=list, description="Up to 3 highest-magnitude (most impactful) headlines."
+    )
+    note: str | None = Field(None, description="Set when sentiment is degraded (e.g. no API key / no news).")
+
+
 class AnalysisResponse(BaseModel):
     """Combined response returned by POST /analysis/run."""
 
@@ -141,6 +213,8 @@ class AnalysisResponse(BaseModel):
     shap_explanation: list[ShapAttribution]
     analyst: AnalystReport
     forecast: ForecastReport
+    risk_report: RiskReport
+    sentiment_report: SentimentReport
     judge_verdict: JudgeVerdict
 
 

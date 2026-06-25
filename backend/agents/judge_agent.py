@@ -26,6 +26,9 @@ from backend.schemas import (
     AnalystReport,
     ForecastReport,
     JudgeVerdict,
+    RiskReport,
+    RiskTier,
+    SentimentReport,
     Verdict,
 )
 
@@ -38,6 +41,32 @@ WIDE_CI_THRESHOLD = 0.3
 # Verdict thresholds on the consistency score.
 APPROVE_MIN_CONSISTENCY = 0.7
 REJECT_MAX_CONSISTENCY = 0.3
+
+# The consistency score has two stages: a *directional* agreement score and a
+# *confidence* modifier. They answer different questions:
+#
+#   1. Directional agreement (analyst + sentiment): do the independent reads
+#      point the same WAY as the forecast? These are the only inherently
+#      directional signals. Weights must sum to 1 so the score stays in [0, 1].
+#        * Analyst (0.6): the heavier corroborator — it reads the same price/
+#          fundamental data family as the forecast, so agreement is the most
+#          meaningful coherence check.
+#        * Sentiment (0.4): a genuinely *independent* signal (news, not price);
+#          divergence here is informative.
+ANALYST_WEIGHT = 0.6
+SENTIMENT_WEIGHT = 0.4
+
+#   2. Confidence modifier (risk): how much should we TRUST the directional call
+#      at all? Risk is not directional — elevated volatility doesn't argue up or
+#      down, it argues "trust any directional call less". So the risk tier scales
+#      the directional score multiplicatively rather than voting on direction.
+#      High risk applies a haircut; Low and Medium leave it untouched (Low must
+#      not *boost* confidence, only avoid penalising it).
+_RISK_TIER_CONFIDENCE_FACTOR = {
+    RiskTier.LOW: 1.0,
+    RiskTier.MEDIUM: 1.0,
+    RiskTier.HIGH: 0.85,
+}
 
 GROQ_MODEL = "llama-3.3-70b-versatile"
 
@@ -63,6 +92,12 @@ GROQ_SYSTEM_PROMPT = (
     "reliability. Do NOT use the words 'accurate', 'accuracy', 'correct', "
     "'reliable', 'reliable performance', 'right', 'proven', or 'validated', nor "
     "any synonym that suggests the prediction will hold true.\n"
+    "- The risk tier is a PENALTY-ONLY confidence modifier. A High tier REDUCES "
+    "trust in the call. A Low or Medium tier merely AVOIDS a penalty — it does "
+    "NOT raise, boost, increase, improve, or strengthen trust or confidence. "
+    "NEVER write that low or medium risk increases/boosts/raises confidence or "
+    "trust, not even hypothetically ('would normally increase trust'). At most "
+    "say it 'does not reduce' or 'leaves trust unchanged'.\n"
     "- Frame everything as agreement/disagreement between agents and as "
     "model-reported confidence. Describe what was measured, not what will happen."
 )
@@ -85,10 +120,26 @@ _BANNED_PATTERN = re.compile(
     r"\b(?:" + "|".join(_BANNED_VOCABULARY) + r")\w*", re.IGNORECASE
 )
 
+# Second guardrail: risk is a penalty-only modifier, so the reasoning must never
+# say low/medium risk *raises* trust or confidence. We catch an increase-style
+# verb aimed at "trust" or "confidence" within a few words (e.g. "increase
+# trust", "boosts confidence", "would normally increase trust in the forecast").
+# "low confidence"/"reduced confidence" never match — there is no boost verb.
+_RISK_BOOST_PATTERN = re.compile(
+    r"\b(?:increas\w*|boost\w*|rais\w*|elevat\w*|improv\w*|strengthen\w*|"
+    r"heighten\w*|bolster\w*|enhanc\w*)\b(?:\W+\w+){0,3}?\W+(?:trust|confidence)\b",
+    re.IGNORECASE,
+)
+
 
 def _banned_terms_in(text: str) -> list[str]:
     """Return any banned-vocabulary matches found in ``text`` (empty if clean)."""
     return [m.group(0) for m in _BANNED_PATTERN.finditer(text)]
+
+
+def _risk_boost_phrases_in(text: str) -> list[str]:
+    """Return any phrases implying risk *boosts* trust/confidence (empty if clean)."""
+    return [m.group(0) for m in _RISK_BOOST_PATTERN.finditer(text)]
 
 
 def _analyst_composite_prob(report: AnalystReport) -> float:
@@ -115,15 +166,49 @@ def _analyst_composite_prob(report: AnalystReport) -> float:
     return (composite + 1.0) / 2.0  # [0, 1]
 
 
-def _compute_consistency(analyst_prob_up: float, forecast_prob_up: float) -> float:
-    """Score how well the analyst and forecast directions agree, in [0, 1].
+def _sentiment_prob_up(report: SentimentReport) -> float:
+    """Map the aggregate sentiment polarity [-1, 1] onto a P(up)-like [0, 1]."""
+    return (report.sentiment_score + 1.0) / 2.0
 
-    Both views live on a shared P(up) scale, so their absolute difference is a
-    natural disagreement metric: identical convictions score 1.0, opposite
-    convictions (0 vs 1) score 0.0. This rewards directional agreement while
-    still penalising magnitude gaps between a weak and a strong call.
+
+def _risk_confidence_factor(report: RiskReport) -> float:
+    """Confidence haircut implied by the risk tier (multiplicative, in (0, 1])."""
+    return _RISK_TIER_CONFIDENCE_FACTOR[report.risk_tier]
+
+
+def _agreement(signal_prob_up: float, forecast_prob_up: float) -> float:
+    """Directional agreement of one signal with the forecast, in [0, 1].
+
+    Both live on a shared P(up) scale, so their absolute difference is a natural
+    disagreement metric: identical convictions score 1.0, opposite ones 0.0.
     """
-    return 1.0 - abs(analyst_prob_up - forecast_prob_up)
+    return 1.0 - abs(signal_prob_up - forecast_prob_up)
+
+
+def _compute_consistency(
+    analyst_prob_up: float,
+    sentiment_prob_up: float,
+    forecast_prob_up: float,
+    risk_confidence_factor: float,
+) -> float:
+    """Risk-modulated directional agreement of analyst and sentiment with the forecast.
+
+    Two stages:
+      1. Directional agreement — how well the analyst and sentiment reads point
+         the same WAY as the forecast, blended with the documented weights
+         (analyst 0.6, sentiment 0.4; they sum to 1, so this stays in [0, 1]).
+      2. Confidence modifier — the directional score is then scaled by the risk
+         tier's factor. Risk informs *how much to trust* the call, not which way
+         to lean: a High tier applies a haircut (less trust under elevated
+         volatility); Low/Medium leave the score untouched (Low does not boost).
+
+    The product stays in [0, 1] since both stages are in [0, 1].
+    """
+    directional = (
+        ANALYST_WEIGHT * _agreement(analyst_prob_up, forecast_prob_up)
+        + SENTIMENT_WEIGHT * _agreement(sentiment_prob_up, forecast_prob_up)
+    )
+    return directional * risk_confidence_factor
 
 
 def _collect_flags(forecast: ForecastReport) -> list[str]:
@@ -171,7 +256,11 @@ def _fallback_reasoning(
 
 
 def _generate_override_reasoning(
-    verdict: Verdict, consistency_score: float, flags: list[str]
+    verdict: Verdict,
+    consistency_score: float,
+    flags: list[str],
+    risk_tier: str,
+    sentiment_label: str,
 ) -> str:
     """Ask a Groq-hosted LLM to justify the verdict in 2-3 plain-English sentences.
 
@@ -188,10 +277,13 @@ def _generate_override_reasoning(
         "Justify the verdict below for a compliance audit log in 2-3 plain-English "
         "sentences. Reference the numbers.\n\n"
         f"Verdict: {verdict.value}\n"
-        f"Consistency score: {consistency_score:.2f} — measures only how closely the "
-        "analyst agent's signals and the forecast agent's directional call AGREE with "
-        "each other (1.0 = identical direction, 0.0 = opposite). It says nothing about "
-        "whether the prediction will come true.\n"
+        f"Consistency score: {consistency_score:.2f} — how closely two independent reads "
+        "(analyst technicals and news sentiment) AGREE in direction with the forecast "
+        "agent's call (1.0 = aligned, 0.0 = opposed), then scaled down when the asset's "
+        "risk tier is High (elevated volatility = trust any directional call less). Risk "
+        "informs HOW MUCH to trust the forecast, not which way to lean. The score says "
+        "nothing about whether the prediction will come true.\n"
+        f"Risk tier of the asset: {risk_tier} (a confidence modifier). News sentiment: {sentiment_label}.\n"
         f"Risk flags: {flag_text} — these are confidence / data-quality signals derived "
         "from the model's own internal uncertainty (e.g. wide confidence interval, "
         "near-coin-flip probability). They do not measure real-world outcomes.\n"
@@ -212,14 +304,16 @@ def _generate_override_reasoning(
         )
         reasoning = completion.choices[0].message.content.strip()
 
-        # Verify the model honoured the vocabulary constraint. If it slipped a
-        # banned term in, the text is not audit-safe, so we discard it and fall
-        # back to the deterministic summary rather than publish the claim.
+        # Verify the model honoured the prose constraints. If it slipped in a
+        # banned correctness term, or implied that low/medium risk *boosts*
+        # confidence, the text is not audit-safe — discard it and fall back to
+        # the deterministic summary rather than publish the claim.
         banned = _banned_terms_in(reasoning)
-        if banned:
+        risk_boost = _risk_boost_phrases_in(reasoning)
+        if banned or risk_boost:
             logger.warning(
-                "Override reasoning contained banned vocabulary %s; using fallback.",
-                banned,
+                "Override reasoning rejected (banned=%s, risk-boost=%s); using fallback.",
+                banned, risk_boost,
             )
             return _fallback_reasoning(verdict, consistency_score, flags)
         return reasoning
@@ -229,13 +323,18 @@ def _generate_override_reasoning(
 
 
 def run_judge_agent(
-    analyst: AnalystReport, forecast: ForecastReport
+    analyst: AnalystReport,
+    forecast: ForecastReport,
+    risk: RiskReport,
+    sentiment: SentimentReport,
 ) -> JudgeVerdict:
-    """Adjudicate a forecast against its analyst report and return a JudgeVerdict.
+    """Adjudicate a forecast against the analyst, risk and sentiment reports.
 
     Args:
-        analyst: The descriptive read of the asset.
+        analyst: The descriptive technical/fundamental read of the asset.
         forecast: The predictive call (with confidence interval) to adjudicate.
+        risk: The downside/volatility profile (contributes a directional lean).
+        sentiment: The recent news polarity (an independent directional signal).
 
     Returns:
         A :class:`JudgeVerdict` with the consistency score, flags, an
@@ -243,12 +342,19 @@ def run_judge_agent(
     """
     analyst_prob_up = _analyst_composite_prob(analyst)
     consistency_score = _compute_consistency(
-        analyst_prob_up, forecast.direction_probability
+        analyst_prob_up=analyst_prob_up,
+        sentiment_prob_up=_sentiment_prob_up(sentiment),
+        forecast_prob_up=forecast.direction_probability,
+        risk_confidence_factor=_risk_confidence_factor(risk),
     )
     flags = _collect_flags(forecast)
     verdict = _decide_verdict(consistency_score, flags)
     override_reasoning = _generate_override_reasoning(
-        verdict, consistency_score, flags
+        verdict,
+        consistency_score,
+        flags,
+        risk_tier=risk.risk_tier.value,
+        sentiment_label=sentiment.sentiment_label.value,
     )
 
     return JudgeVerdict(
