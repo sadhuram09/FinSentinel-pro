@@ -23,3 +23,7 @@ mlflow.db
 *.sqlite
 *.db
 /drift_reports/
+
+# Local application database (users, analysis history). Covered by *.db above,
+# but listed explicitly to document intent.
+finsentinel.db

@@ -22,3 +22,10 @@ beautifulsoup4>=4.12
 mlflow>=2.10
 evidently>=0.4
 matplotlib>=3.7
+sqlalchemy>=2.0
+passlib[bcrypt]>=1.7
+# passlib 1.7.4's bcrypt backend breaks on bcrypt>=4.1 (raises on its 72-byte
+# self-probe); pin to the last compatible bcrypt until passlib is updated.
+bcrypt>=4.0,<4.1
+PyJWT>=2.8
+email-validator>=2.0
