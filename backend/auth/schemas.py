@@ -12,6 +12,7 @@ class UserCreate(BaseModel):
 
     email: EmailStr
     password: str = Field(..., min_length=8, max_length=128, description="Plaintext password (>= 8 chars).")
+    name: str | None = Field(None, max_length=120, description="Optional display name.")
 
 
 class UserLogin(BaseModel):
@@ -28,6 +29,7 @@ class UserOut(BaseModel):
 
     id: int
     email: EmailStr
+    name: str | None = None
     created_at: datetime
 
 

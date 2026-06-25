@@ -21,6 +21,10 @@ interface ShaderButtonProps {
   href?: string;
   variant?: Variant;
   className?: string;
+  /** Button mode (when neither `to` nor `href` is given): form submit / click. */
+  type?: "button" | "submit";
+  onClick?: () => void;
+  disabled?: boolean;
 }
 
 const GRAIN =
@@ -37,10 +41,14 @@ export default function ShaderButton({
   href,
   variant = "primary",
   className = "",
+  type = "button",
+  onClick,
+  disabled = false,
 }: ShaderButtonProps) {
   const classes =
     "group relative inline-flex select-none items-center justify-center overflow-hidden rounded-[4px] border px-6 py-3 font-sans text-sm font-medium tracking-wide " +
     "transition-all duration-200 ease-out hover:-translate-y-0.5 active:translate-y-0 active:scale-[0.98] " +
+    "disabled:cursor-not-allowed disabled:opacity-60 disabled:hover:translate-y-0 " +
     `${VARIANTS[variant]} ${className}`;
 
   const inner = (
@@ -55,6 +63,14 @@ export default function ShaderButton({
     </>
   );
 
+  if (to) {
+    return (
+      <Link to={to} className={classes}>
+        {inner}
+      </Link>
+    );
+  }
+
   if (href) {
     return (
       <a href={href} target="_blank" rel="noopener noreferrer" className={classes}>
@@ -64,8 +80,8 @@ export default function ShaderButton({
   }
 
   return (
-    <Link to={to ?? "#"} className={classes}>
+    <button type={type} onClick={onClick} disabled={disabled} className={classes}>
       {inner}
-    </Link>
+    </button>
   );
 }

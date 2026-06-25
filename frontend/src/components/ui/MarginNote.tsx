@@ -14,12 +14,21 @@
 import type { CSSProperties, ReactNode } from "react";
 
 type Side = "left" | "right" | "top" | "bottom";
+type Tone = "muted" | "error";
 
 interface MarginNoteProps {
   children: ReactNode;
   className?: string;
   side?: Side;
+  /** "error" tints the note (and its connector) in the rejected verdict colour. */
+  tone?: Tone;
 }
+
+// The connector uses currentColor, so the tone colours both text and line.
+const TONE_CLASS: Record<Tone, string> = {
+  muted: "text-paper-muted",
+  error: "text-verdict-rejected",
+};
 
 // Per-side connector geometry: where the SVG sits relative to the note, its
 // box, the curved path, and the referent anchor dot at the far end.
@@ -53,11 +62,16 @@ const CONNECTORS: Record<
   },
 };
 
-export default function MarginNote({ children, className = "", side = "left" }: MarginNoteProps) {
+export default function MarginNote({
+  children,
+  className = "",
+  side = "left",
+  tone = "muted",
+}: MarginNoteProps) {
   const c = CONNECTORS[side];
 
   return (
-    <div className={`pointer-events-none absolute z-40 text-paper-muted ${className}`}>
+    <div className={`pointer-events-none absolute z-40 ${TONE_CLASS[tone]} ${className}`}>
       <div className="relative">
         <p className="note-hand max-w-[12rem] text-[15px] leading-snug">{children}</p>
 

@@ -12,6 +12,7 @@ import os
 
 from dotenv import load_dotenv
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 
 from backend.auth import router as auth_router
 from backend.auth.security import is_using_dev_secret
@@ -52,6 +53,18 @@ app = FastAPI(
         "explanations."
     ),
     version="1.0.0",
+)
+
+# Allow the Vite dev frontend to call the API *with credentials* (the httpOnly
+# session cookie). allow_credentials=True requires explicit origins, never "*".
+# Override allowed origins via CORS_ORIGINS (comma-separated) in deployment.
+_cors_origins = os.getenv("CORS_ORIGINS", "http://localhost:5180").split(",")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[o.strip() for o in _cors_origins if o.strip()],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 app.include_router(auth_router.router)
