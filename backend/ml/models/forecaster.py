@@ -13,13 +13,21 @@ The model frames direction as binary classification (P(up)) per horizon, and
 derives a 3-way Direction by applying a neutral band around 0.5 so we don't
 emit confident calls on coin-flip probabilities.
 
-This module trains lazily on the supplied feature history. In production you
-would persist fitted boosters; here we (re)fit on the request's lookback window
-so the scaffold runs end-to-end without a model registry.
+Production flow: boosters are trained offline by ``scripts/train_models.py`` on
+a pooled, multi-year, multi-ticker dataset and persisted to ``models/*.joblib``.
+This module loads those at import time. If no persisted model is found (e.g. a
+fresh clone before training has run), it falls back to fitting per request on
+the caller's lookback window so the scaffold still works end-to-end — but logs a
+clear warning, because per-request fitting overfits a single ticker's recent
+history and is not how the system is meant to run.
 """
 
 from __future__ import annotations
 
+import logging
+from pathlib import Path
+
+import joblib
 import pandas as pd
 from lightgbm import LGBMClassifier
 from xgboost import XGBClassifier
@@ -27,10 +35,23 @@ from xgboost import XGBClassifier
 from backend.schemas import Direction, ForecastReport, HorizonForecast, ShapAttribution
 from backend.ml.explainability.shap_explainer import explain_prediction
 
+logger = logging.getLogger(__name__)
+
 MODEL_VERSION = "ensemble-v1.0.0"
+
+# Project-root ``models/`` directory holding persisted boosters.
+# forecaster.py lives at backend/ml/models/, so the project root is parents[3].
+MODELS_DIR = Path(__file__).resolve().parents[3] / "models"
 
 # Feature columns the ensemble consumes. Kept explicit so SHAP attributions and
 # the trained matrix stay aligned.
+#
+# NOTE: intentionally technical-only. Fundamental ratios (P/E, ROE, D/E) are NOT
+# in the predictive matrix because yfinance exposes only the *current* snapshot,
+# not a point-in-time history — using today's P/E as a feature for a label from
+# three years ago would leak future information into training. Fundamentals are
+# instead consumed by the analyst and judge layers. Training and inference must
+# use exactly this set, or a persisted model will not load against live data.
 FEATURE_COLUMNS = [
     "rsi",
     "macd",
@@ -54,6 +75,42 @@ NEUTRAL_BAND = 0.05
 HORIZONS = (5, 30)
 
 
+def model_path(horizon: int, models_dir: Path = MODELS_DIR) -> Path:
+    """Canonical path of the persisted, ticker-agnostic bundle for a horizon."""
+    return models_dir / f"ensemble_h{horizon}.joblib"
+
+
+def build_xgb() -> XGBClassifier:
+    """Construct an unfitted XGBoost classifier with the project's hyperparameters.
+
+    Centralised so offline training (scripts/train_models.py) and the
+    fit-per-request fallback produce identical model configurations.
+    """
+    return XGBClassifier(
+        n_estimators=200,
+        max_depth=4,
+        learning_rate=0.05,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        eval_metric="logloss",
+        tree_method="hist",
+        random_state=42,
+    )
+
+
+def build_lgbm() -> LGBMClassifier:
+    """Construct an unfitted LightGBM classifier with the project's hyperparameters."""
+    return LGBMClassifier(
+        n_estimators=200,
+        max_depth=4,
+        learning_rate=0.05,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        random_state=42,
+        verbose=-1,
+    )
+
+
 def _build_labels(close: pd.Series, horizon: int) -> pd.Series:
     """Binary label: 1 if close rises over the next ``horizon`` trading days."""
     future = close.shift(-horizon)
@@ -72,16 +129,61 @@ def _direction_from_prob(prob_up: float) -> Direction:
 class StackedForecaster:
     """Weighted-average ensemble of XGBoost and LightGBM classifiers.
 
-    One pair of boosters is trained per horizon. ``fit`` and ``predict`` operate
-    on the engineered technical feature frame produced upstream.
+    One pair of boosters is held per horizon. The pair is either loaded from a
+    persisted bundle (production path) or fitted in-memory (fallback path);
+    ``predict`` behaves identically either way.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, model_version: str = MODEL_VERSION) -> None:
         self._models: dict[int, tuple[XGBClassifier, LGBMClassifier]] = {}
-        self._last_train_features: pd.DataFrame | None = None
+        self._model_version = model_version
+
+    @property
+    def model_version(self) -> str:
+        return self._model_version
+
+    @classmethod
+    def load_pretrained(
+        cls, models_dir: Path = MODELS_DIR
+    ) -> "StackedForecaster | None":
+        """Load persisted boosters for every horizon, or return None if incomplete.
+
+        A bundle is a dict with ``xgb``/``lgbm`` estimators plus metadata
+        (``feature_columns``, ``model_version``). If any horizon's file is
+        missing the whole load is treated as unavailable, so we never serve a
+        partially-loaded ensemble.
+        """
+        if not models_dir.exists():
+            return None
+
+        models: dict[int, tuple[XGBClassifier, LGBMClassifier]] = {}
+        version = MODEL_VERSION
+        for horizon in HORIZONS:
+            path = model_path(horizon, models_dir)
+            if not path.exists():
+                logger.warning("Persisted model missing for horizon %sd: %s", horizon, path)
+                return None
+            bundle = joblib.load(path)
+            cols = bundle.get("feature_columns")
+            if cols is not None and list(cols) != FEATURE_COLUMNS:
+                # A feature-schema drift would silently corrupt predictions.
+                logger.error(
+                    "Persisted model %s has feature columns %s, expected %s; ignoring.",
+                    path, cols, FEATURE_COLUMNS,
+                )
+                return None
+            models[horizon] = (bundle["xgb"], bundle["lgbm"])
+            version = bundle.get("model_version", MODEL_VERSION)
+
+        instance = cls(model_version=version)
+        instance._models = models
+        return instance
 
     def fit(self, features: pd.DataFrame) -> "StackedForecaster":
         """Fit one XGB+LGBM pair per horizon on the engineered feature frame.
+
+        Used only by the fallback path (and tests). The model version is tagged
+        ``-fit-per-request`` so the API response makes the provenance obvious.
 
         Args:
             features: Frame containing :data:`FEATURE_COLUMNS` plus a ``Close``
@@ -95,30 +197,13 @@ class StackedForecaster:
             x = frame[FEATURE_COLUMNS]
             y = frame["y"].to_numpy()
 
-            xgb = XGBClassifier(
-                n_estimators=200,
-                max_depth=4,
-                learning_rate=0.05,
-                subsample=0.8,
-                colsample_bytree=0.8,
-                eval_metric="logloss",
-                tree_method="hist",
-                random_state=42,
-            )
-            lgbm = LGBMClassifier(
-                n_estimators=200,
-                max_depth=4,
-                learning_rate=0.05,
-                subsample=0.8,
-                colsample_bytree=0.8,
-                random_state=42,
-                verbose=-1,
-            )
+            xgb = build_xgb()
+            lgbm = build_lgbm()
             xgb.fit(x, y)
             lgbm.fit(x, y)
             self._models[horizon] = (xgb, lgbm)
 
-        self._last_train_features = features
+        self._model_version = f"{MODEL_VERSION}-fit-per-request"
         return self
 
     def _predict_proba(self, horizon: int, x: pd.DataFrame) -> float:
@@ -137,7 +222,7 @@ class StackedForecaster:
         — wider spread means less certainty.
         """
         if not self._models:
-            raise RuntimeError("StackedForecaster.predict called before fit().")
+            raise RuntimeError("StackedForecaster.predict called before fit/load.")
 
         latest = features[FEATURE_COLUMNS].dropna().iloc[[-1]]
         x = latest
@@ -172,10 +257,40 @@ class StackedForecaster:
 
         return ForecastReport(
             ticker=ticker,
-            model_version=MODEL_VERSION,
+            model_version=self._model_version,
             prediction=headline.direction,
             direction_probability=headline.probability_up,
             horizons=horizon_forecasts,
             confidence_interval=(lower, upper),
             shap_explanation=shap_attrs,
         )
+
+
+# Load persisted boosters once at import. None means "no trained model on disk".
+_PRETRAINED: StackedForecaster | None = StackedForecaster.load_pretrained()
+if _PRETRAINED is not None:
+    logger.info("Loaded pretrained forecaster '%s' from %s", _PRETRAINED.model_version, MODELS_DIR)
+else:
+    logger.warning(
+        "No persisted models found in %s. Falling back to per-request fitting "
+        "(scaffold mode); run `python scripts/train_models.py` to train and "
+        "persist a production model.",
+        MODELS_DIR,
+    )
+
+
+def forecast(ticker: str, features: pd.DataFrame) -> ForecastReport:
+    """Predict using the persisted model, or fit-per-request if none is loaded.
+
+    This is the single entry point the forecast agent should call. It hides the
+    pretrained-vs-fallback decision so callers never accidentally retrain when a
+    persisted model is available.
+    """
+    if _PRETRAINED is not None:
+        return _PRETRAINED.predict(ticker=ticker, features=features)
+
+    logger.warning(
+        "Serving '%s' for %s by fitting on the request window — no persisted "
+        "model available.", ticker, f"{MODEL_VERSION}-fit-per-request",
+    )
+    return StackedForecaster().fit(features).predict(ticker=ticker, features=features)

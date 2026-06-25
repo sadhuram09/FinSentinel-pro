@@ -6,3 +6,9 @@ node_modules/
 .pytest_cache/
 chroma_db/
 mlruns/
+
+# Trained model artifacts — too large and not reproducible from git;
+# regenerate with `python scripts/train_models.py`.
+# Leading slash anchors to the project root so it does NOT also match the
+# backend/ml/models/ source package.
+/models/
