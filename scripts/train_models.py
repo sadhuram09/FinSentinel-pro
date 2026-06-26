@@ -227,26 +227,30 @@ def save_feature_baseline(pooled: pd.DataFrame) -> Path:
     return FEATURE_BASELINE_PATH
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Train and persist FinSentinel ensembles.")
-    parser.add_argument("--tickers", nargs="+", default=DEFAULT_TICKERS, help="Tickers to pool.")
-    parser.add_argument("--years", type=int, default=DEFAULT_YEARS, help="Years of history (>=5).")
-    parser.add_argument(
-        "--models-dir",
-        type=Path,
-        default=PROJECT_ROOT / "models",
-        help="Directory to write .joblib bundles into.",
-    )
-    args = parser.parse_args()
+def run_training(
+    tickers: list[str] = DEFAULT_TICKERS,
+    years: int = DEFAULT_YEARS,
+    models_dir: Path = PROJECT_ROOT / "models",
+) -> str:
+    """Run the full training pipeline and register the ensemble under ``@staging``.
 
-    if args.years < 5:
-        parser.error("Need at least 5 years of history for a meaningful time-series split.")
+    This is the importable entry point shared by the CLI (:func:`main`) and the
+    FastAPI startup bootstrap (train-on-cold-start), so both run *exactly* the
+    same pipeline: pool data, train both horizons, persist ``.joblib`` bundles,
+    log params/metrics/plots to MLflow, and register a new model version aliased
+    ``@staging``.
 
-    args.models_dir.mkdir(parents=True, exist_ok=True)
+    Returns the new registered model version number (as a string) so the caller
+    can promote it to ``@production``.
+    """
+    if years < 5:
+        raise ValueError("Need at least 5 years of history for a meaningful time-series split.")
+
+    models_dir.mkdir(parents=True, exist_ok=True)
     version = f"{MODEL_VERSION}-pooled-{datetime.now():%Y%m%d-%H%M%S}"
 
-    print(f"Pooling {len(args.tickers)} tickers over ~{args.years}y: {', '.join(args.tickers)}")
-    pooled = build_pooled_dataset(args.tickers, args.years)
+    print(f"Pooling {len(tickers)} tickers over ~{years}y: {', '.join(tickers)}")
+    pooled = build_pooled_dataset(tickers, years)
     print(f"Pooled dataset: {len(pooled)} feature rows across {pooled['ticker'].nunique()} tickers.")
 
     # Point MLflow at the local SQLite store and our experiment.
@@ -260,9 +264,9 @@ def main() -> None:
         mlflow.log_params(
             {
                 "model_type": "stacked-ensemble(xgboost+lightgbm)",
-                "tickers": ",".join(sorted(args.tickers)),
+                "tickers": ",".join(sorted(tickers)),
                 "n_tickers": pooled["ticker"].nunique(),
-                "years": args.years,
+                "years": years,
                 "date_start": str(pooled["date"].min().date()),
                 "date_end": str(pooled["date"].max().date()),
                 "n_rows": len(pooled),
@@ -282,11 +286,11 @@ def main() -> None:
         )
 
         # --- train each horizon; log metrics + plots ------------------------
-        plot_dir = args.models_dir / "plots"
+        plot_dir = models_dir / "plots"
         plot_dir.mkdir(parents=True, exist_ok=True)
         all_models: dict[int, tuple] = {}
         for horizon in HORIZONS:
-            res = train_horizon(pooled, horizon, args.models_dir, version)
+            res = train_horizon(pooled, horizon, models_dir, version)
             all_models[horizon] = (res["xgb"], res["lgbm"])
             # metrics: auc/f1/brier per model per horizon
             for model_name, m in res["metrics"].items():
@@ -317,7 +321,26 @@ def main() -> None:
         print(f"Tracking URI    : {registry.TRACKING_URI}")
         print("Promote to production with: python scripts/promote_model.py")
 
-    print(f"\nDone. Models written to {args.models_dir}")
+    print(f"\nDone. Models written to {models_dir}")
+    return new_version
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Train and persist FinSentinel ensembles.")
+    parser.add_argument("--tickers", nargs="+", default=DEFAULT_TICKERS, help="Tickers to pool.")
+    parser.add_argument("--years", type=int, default=DEFAULT_YEARS, help="Years of history (>=5).")
+    parser.add_argument(
+        "--models-dir",
+        type=Path,
+        default=PROJECT_ROOT / "models",
+        help="Directory to write .joblib bundles into.",
+    )
+    args = parser.parse_args()
+
+    if args.years < 5:
+        parser.error("Need at least 5 years of history for a meaningful time-series split.")
+
+    run_training(tickers=args.tickers, years=args.years, models_dir=args.models_dir)
 
 
 if __name__ == "__main__":

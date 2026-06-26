@@ -50,3 +50,29 @@ def ensure_experiment() -> str:
 def registry_initialised() -> bool:
     """True if the SQLite registry exists (avoids creating it just to read)."""
     return DB_PATH.exists()
+
+
+def production_model_exists() -> bool:
+    """True if a ``@production``-aliased version of the model is registered.
+
+    Used by the API startup bootstrap to decide whether to train on cold start.
+    Returns False (rather than raising) when the registry has never been created
+    or the alias has never been set, so an absent model is a clean "no" instead
+    of an error.
+    """
+    if not DB_PATH.exists():
+        return False
+    configure()
+    client = mlflow.MlflowClient()
+    try:
+        client.get_model_version_by_alias(MODEL_NAME, PRODUCTION_ALIAS)
+        return True
+    except Exception:  # noqa: BLE001 - no registry/model/alias yet
+        return False
+
+
+def promote_to_production(version: str) -> None:
+    """Point the ``@production`` alias at ``version`` (string version number)."""
+    configure()
+    client = mlflow.MlflowClient()
+    client.set_registered_model_alias(MODEL_NAME, PRODUCTION_ALIAS, version)

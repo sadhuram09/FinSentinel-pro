@@ -348,6 +348,21 @@ def _initialise_forecaster() -> "StackedForecaster | None":
 _PRETRAINED: StackedForecaster | None = _initialise_forecaster()
 
 
+def reload_forecaster() -> "StackedForecaster | None":
+    """Re-resolve the active forecaster and return it.
+
+    ``_PRETRAINED`` is resolved once at import, *before* the FastAPI startup
+    bootstrap may train-and-promote a model on a cold start. Calling this after
+    such a bootstrap re-runs the registry -> joblib -> fallback resolution so the
+    freshly promoted ``@production`` model is actually picked up without a second
+    process restart. ``forecast()`` reads the module global at call time, so the
+    reassignment takes effect for every subsequent request.
+    """
+    global _PRETRAINED
+    _PRETRAINED = _initialise_forecaster()
+    return _PRETRAINED
+
+
 def forecast(ticker: str, features: pd.DataFrame) -> ForecastReport:
     """Predict using the persisted model, or fit-per-request if none is loaded.
 

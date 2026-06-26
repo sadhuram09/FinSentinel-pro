@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import os
+from contextlib import asynccontextmanager
 
 from dotenv import load_dotenv
 from fastapi import FastAPI
@@ -17,12 +18,35 @@ from fastapi.middleware.cors import CORSMiddleware
 from backend.auth import router as auth_router
 from backend.auth.security import is_using_dev_secret
 from backend.database import init_db
+from backend.ml.models.forecaster import reload_forecaster
+from backend.mlops.bootstrap import ensure_production_model
 from backend.routers import analysis, history, mlops
 
 # Load environment variables from .env before anything reads config.
 load_dotenv()
 
 logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Block startup until a production model is available.
+
+    On a cold start with no registered ``@production`` model, train one inline
+    (same pipeline as ``scripts/train_models.py``) and promote it before the app
+    accepts requests. The forecaster resolves its active model at import — i.e.
+    *before* this runs — so on a fresh-train we re-resolve it here, otherwise the
+    just-promoted model would not be picked up until the next process restart.
+    """
+    trained = ensure_production_model()
+    if trained:
+        forecaster = reload_forecaster()
+        logger.info(
+            "Reloaded forecaster after startup training: %s",
+            forecaster.model_version if forecaster is not None else "fallback (per-request fitting)",
+        )
+    yield
 
 
 def _guard_production_secret() -> None:
@@ -53,6 +77,7 @@ app = FastAPI(
         "explanations."
     ),
     version="1.0.0",
+    lifespan=lifespan,
 )
 
 # Allow the Vite dev frontend to call the API *with credentials* (the httpOnly
